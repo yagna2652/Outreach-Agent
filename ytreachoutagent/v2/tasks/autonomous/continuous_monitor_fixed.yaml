@@ -1,0 +1,92 @@
+name: Continuous Monitor Fixed
+description: Monitor with proper API call tools
+
+input_schema:
+  type: object
+  properties:
+    spreadsheet_id:
+      type: string
+    google_auth_token:
+      type: string
+    apify_token:
+      type: string
+    process_video_task_id:
+      type: string
+      default: "068f37ed-f8c5-7d53-8000-48dc90d22b05"
+  required:
+    - spreadsheet_id
+    - google_auth_token
+    - apify_token
+
+tools:
+  # Define Google Sheets API call tool
+  - name: read_google_sheets
+    type: api_call
+    description: Read data from Google Sheets
+    api_call:
+      method: GET
+
+  # Define system tool for task execution
+  - name: create_task_execution
+    description: Launch a new execution for the process_video task
+    type: system
+    system:
+      resource: task
+      subresource: execution
+      operation: create
+
+main:
+  # Step 1: Read Google Sheets data using the defined tool
+  - tool: read_google_sheets
+    arguments:
+      url: "${ 'https://sheets.googleapis.com/v4/spreadsheets/' + steps[0].input.spreadsheet_id + '/values/A1:F100' }"
+      headers:
+        Authorization: "${ 'Bearer ' + steps[0].input.google_auth_token }"
+
+  # Step 2: Parse sheet data
+  - evaluate:
+      sheet_data: ${ steps[1].output.values if steps[1].output and steps[1].output.values else [] }
+      data_rows: ${ _.sheet_data[1:] if len(_.sheet_data) > 1 else [] }
+
+  # Step 3: Find first pending video
+  - evaluate:
+      pending_videos: |
+        [
+          {
+            'row_number': idx + 2,
+            'creator_name': row[0] if len(row) > 0 else '',
+            'youtube_url': row[1] if len(row) > 1 else '',
+            'email': row[2] if len(row) > 2 else '',
+            'status': row[3] if len(row) > 3 else ''
+          }
+          for idx, row in enumerate(_.data_rows)
+          if len(row) > 1
+          and row[1]
+          and (len(row) < 4 or row[3].lower() in ['pending', ''])
+        ]
+      first_pending: ${ _.pending_videos[0] if len(_.pending_videos) > 0 else None }
+
+  # Step 4: Process video if found (using system tool for task execution)
+  - if: ${ _.first_pending is not None }
+    then:
+      tool: create_task_execution
+      arguments:
+        task_id: ${ steps[0].input.process_video_task_id }
+        data:
+          input:
+            creator_name: ${ _.first_pending['creator_name'] }
+            youtube_url: ${ _.first_pending['youtube_url'] }
+            email: ${ _.first_pending['email'] }
+            row_number: ${ _.first_pending['row_number'] }
+            apify_token: ${ steps[0].input.apify_token }
+            google_auth_token: ${ steps[0].input.google_auth_token }
+            spreadsheet_id: ${ steps[0].input.spreadsheet_id }
+            send_email: false
+    else:
+      log: No pending videos found
+
+  # Step 5: Return results
+  - return:
+      videos_found: ${ len(_.pending_videos) }
+      processed: ${ _.first_pending is not None }
+      first_video_url: ${ _.first_pending['youtube_url'] if _.first_pending is not None else None }

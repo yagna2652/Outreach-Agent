@@ -1,0 +1,176 @@
+name: Process Single Video Fixed
+description: Process YouTube video with proper API tools
+
+input_schema:
+  type: object
+  properties:
+    creator_name:
+      type: string
+    youtube_url:
+      type: string
+    email:
+      type: string
+    row_number:
+      type: integer
+    apify_token:
+      type: string
+    google_auth_token:
+      type: string
+    spreadsheet_id:
+      type: string
+    send_email:
+      type: boolean
+      default: false
+  required:
+    - creator_name
+    - youtube_url
+    - row_number
+    - apify_token
+    - google_auth_token
+    - spreadsheet_id
+
+tools:
+  # APIFY MCP Integration Tools
+  - name: apify_mcp_call
+    type: integration
+    integration:
+      provider: mcp
+      method: call_tool
+      setup:
+        transport: http
+        url: https://mcp.apify.com
+        http_headers:
+          Authorization: Bearer ${ steps[0].input.apify_token }
+          Content-Type: application/json
+
+  # Google Sheets API tools
+  - name: update_sheet_status
+    type: api_call
+    description: Update status in Google Sheets
+    api_call:
+      method: PUT
+
+  - name: update_sheet_results
+    type: api_call
+    description: Update results in Google Sheets
+    api_call:
+      method: PUT
+
+main:
+  # Step 1: Update status in Google Sheets
+  - tool: update_sheet_status
+    arguments:
+      url: "${ 'https://sheets.googleapis.com/v4/spreadsheets/' + steps[0].input.spreadsheet_id + '/values/D' + str(steps[0].input.row_number) + ':E' + str(steps[0].input.row_number) + '?valueInputOption=RAW' }"
+      headers:
+        Authorization: "${ 'Bearer ' + steps[0].input.google_auth_token }"
+        Content-Type: application/json
+      json:
+        values:
+          - ["Processing", "Fetching transcript..."]
+
+  # Step 2: Run YouTube Transcript Actor via MCP
+  - tool: apify_mcp_call
+    arguments:
+      tool_name: run_actor
+      arguments:
+        actorId: topaz_sharingan~youtube-transcript-scraper
+        input:
+          startUrls:
+            - url: ${ steps[0].input.youtube_url }
+          includeTimestamps: false
+          format: json
+
+  # Step 3: Wait for actor to complete
+  - sleep:
+      seconds: 10
+
+  # Step 4: Get actor results via MCP
+  - tool: apify_mcp_call
+    arguments:
+      tool_name: get_dataset_items
+      arguments:
+        datasetId: ${ steps[2].output.defaultDatasetId }
+
+  # Step 5: Parse transcript data
+  - evaluate:
+      raw_results: ${ steps[4].output.items }
+      has_results: ${ len(_.raw_results) > 0 }
+
+  - if: ${ _.has_results }
+    then:
+      evaluate:
+        transcript_data:
+          transcript_text: ${ _.raw_results[0]['transcript'] }
+          video_title: ${ _.raw_results[0]['title'] }
+          channel_name: ${ _.raw_results[0]['channel'] }
+    else:
+      evaluate:
+        transcript_data:
+          transcript_text: ""
+          video_title: "Unknown"
+          channel_name: ${ steps[0].input.creator_name }
+
+  # Step 6: Generate personalized email
+  - prompt:
+      - role: system
+        content: |
+          You are an expert at writing personalized outreach emails for YouTube creators.
+          Your emails are:
+          - Under 180 words
+          - Personalized to specific video content
+          - Authentic and non-salesy
+          - Clear about value proposition
+          - Ending with soft call-to-action
+
+      - role: user
+        content: |
+          Generate a personalized outreach email for:
+
+          Creator: ${ steps[0].input.creator_name }
+          Channel: ${ _.transcript_data.channel_name }
+          Video: ${ _.transcript_data.video_title }
+          URL: ${ steps[0].input.youtube_url }
+
+          Video Content (excerpt):
+          ${ _.transcript_data.transcript_text[:2000] if len(_.transcript_data.transcript_text) > 0 else "No transcript available" }
+
+          Our Value Proposition:
+          We help creators optimize their content strategy and grow their audience through AI-powered insights and automation tools.
+
+          Requirements:
+          1. Reference specific content from their video
+          2. Show genuine understanding of their work
+          3. Explain how we can help them specifically
+          4. Propose next steps
+          5. Keep it concise and respectful
+
+  # Step 7: Extract email content
+  - evaluate:
+      generated_email: ${ steps[7].output.choices[0].message.content }
+      email_subject: "${ 'Loved your video: ' + _.transcript_data.video_title[:50] + ('...' if len(_.transcript_data.video_title) > 50 else '') }"
+
+  # Step 8: Determine final status
+  - evaluate:
+      status_text: ${ "Email Sent" if steps[0].input.send_email else "Draft Ready" }
+      email_preview: ${ _.generated_email[:500] }
+
+  # Step 9: Update sheet with results
+  - tool: update_sheet_results
+    arguments:
+      url: "${ 'https://sheets.googleapis.com/v4/spreadsheets/' + steps[0].input.spreadsheet_id + '/values/D' + str(steps[0].input.row_number) + ':F' + str(steps[0].input.row_number) + '?valueInputOption=RAW' }"
+      headers:
+        Authorization: "${ 'Bearer ' + steps[0].input.google_auth_token }"
+        Content-Type: application/json
+      json:
+        values:
+          - - ${ _.status_text }
+            - ${ _.email_subject }
+            - ${ _.email_preview }
+
+  # Step 10: Return processing results
+  - return:
+      creator_name: ${ steps[0].input.creator_name }
+      video_url: ${ steps[0].input.youtube_url }
+      email_subject: ${ _.email_subject }
+      email_body: ${ _.generated_email }
+      transcript_fetched: "${ _.has_results }"

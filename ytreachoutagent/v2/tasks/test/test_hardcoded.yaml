@@ -1,0 +1,24 @@
+name: Test Hardcoded URL
+description: Test with hardcoded URL
+
+input_schema:
+  type: object
+  properties:
+    test:
+      type: string
+
+tools:
+  - name: test_call
+    type: api_call
+    description: Test API call
+    api_call:
+      method: GET
+      url: "https://api.github.com/users/github"
+
+main:
+  # Step 1: Make simple API call
+  - tool: test_call
+
+  # Step 2: Return result
+  - return:
+      response: ${ steps[1] }

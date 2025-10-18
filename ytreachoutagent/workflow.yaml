@@ -1,0 +1,238 @@
+name: YouTube Outreach Complete Workflow
+description: Full workflow with transcript extraction, email generation, and Gmail integration
+
+input_schema:
+  type: object
+  properties:
+    spreadsheet_id:
+      type: string
+      description: Google Sheets ID
+    google_auth_token:
+      type: string
+      description: Google OAuth2 access token
+    apify_token:
+      type: string
+      description: APIFY API token
+    email_address:
+      type: string
+      description: Sender email address
+    gmail_app_password:
+      type: string
+      description: Gmail app-specific password
+    max_rows:
+      type: integer
+      default: 100
+    send_emails:
+      type: boolean
+      default: false
+      description: If true, send emails; if false, create drafts
+
+tools:
+# Google Sheets Reader
+- name: sheets_reader
+  type: api_call
+  api_call:
+    method: GET
+    url: https://sheets.googleapis.com/v4/spreadsheets/${ _.spreadsheet_id }/values/A1:F${ _.max_rows }
+    headers:
+      Authorization: Bearer ${ _.google_auth_token }
+
+# Google Sheets Writer for updating status
+- name: update_status
+  type: api_call
+  api_call:
+    method: PUT
+    url: https://sheets.googleapis.com/v4/spreadsheets/${ _.spreadsheet_id }/values/${ _.range }?valueInputOption=RAW
+    headers:
+      Authorization: Bearer ${ _.google_auth_token }
+      Content-Type: application/json
+    json_body:
+      values: ${ _.values }
+
+# APIFY YouTube Transcript Scraper - Start Run
+- name: start_transcript_scraper
+  type: api_call
+  api_call:
+    method: POST
+    url: https://api.apify.com/v2/acts/topaz_sharingan~youtube-transcript-scraper/runs
+    headers:
+      Content-Type: application/json
+      Authorization: Bearer ${ _.apify_token }
+    json_body:
+      startUrls:
+        - url: ${ _.youtube_url }
+      includeTimestamps: false
+      format: json
+
+# APIFY Get Run Results
+- name: get_transcript_results
+  type: api_call
+  api_call:
+    method: GET
+    url: https://api.apify.com/v2/actor-runs/${ _.run_id }/dataset/items
+    headers:
+      Authorization: Bearer ${ _.apify_token }
+
+# Email Integration Tool
+- name: email_sender
+  type: integration
+  integration:
+    provider: email
+    method: send
+    setup:
+      host: smtp.gmail.com
+      port: 587
+      user: ${ _.email_address }
+      password: ${ _.gmail_app_password }
+
+main:
+# Step 1: Read all data from Google Sheets
+- tool: sheets_reader
+
+# Step 2: Process the sheet data to find pending rows
+- evaluate:
+    sheet_data: ${ steps[0].output.json.values if steps[0].output else [] }
+    headers: ${ _.sheet_data[0] if len(_.sheet_data) > 0 else [] }
+    data_rows: ${ _.sheet_data[1:] if len(_.sheet_data) > 1 else [] }
+
+# Step 3: Find pending rows
+- evaluate:
+    pending_rows: |
+      [
+        {
+          'row_number': idx + 2,
+          'creator_name': row[0] if len(row) > 0 else '',
+          'youtube_url': row[1] if len(row) > 1 else '',
+          'email': row[2] if len(row) > 2 else '',
+          'status': row[3] if len(row) > 3 else ''
+        }
+        for idx, row in enumerate(_.data_rows)
+        if len(row) > 3 and row[3].lower() == 'pending'
+      ]
+
+# Step 4: Log how many pending rows found
+- log: Found ${ len(_.pending_rows) } pending rows to process
+
+# Step 5: Process each pending row
+- foreach:
+    in: _.pending_rows
+    do:
+      # Update status to Processing
+      - tool: update_status
+        arguments:
+          range: D${ _.row_number }:E${ _.row_number }
+          values:
+            - ["Processing", "Fetching transcript..."]
+
+      # Start APIFY transcript scraper
+      - tool: start_transcript_scraper
+        arguments:
+          youtube_url: ${ _.youtube_url }
+
+      # Extract run ID from response
+      - evaluate:
+          run_id: ${ steps[-1].output.json.data.id if steps[-1].output else null }
+
+      # Wait for APIFY to process
+      - sleep:
+          seconds: 8
+
+      # Get transcript results
+      - tool: get_transcript_results
+        arguments:
+          run_id: ${ _.run_id }
+
+      # Extract transcript from results
+      - evaluate:
+          transcript_data: ${ steps[-1].output.json[0] if steps[-1].output.json else {} }
+          transcript_text: ${ _.transcript_data.get('transcript', '') }
+          video_title: ${ _.transcript_data.get('title', 'Unknown') }
+          channel_name: ${ _.transcript_data.get('channel', _.creator_name) }
+
+      # Generate personalized email using Claude
+      - prompt:
+        - role: system
+          content: |
+            You are an expert at writing personalized outreach emails.
+            Generate a concise, engaging email under 180 words that:
+            1. References specific content from their latest video
+            2. Shows genuine interest in their work
+            3. Explains how we can add value to their channel
+            4. Proposes a specific collaboration opportunity
+            5. Ends with a clear but soft call-to-action
+
+            Important:
+            - Be authentic and personal, not salesy
+            - Reference specific moments or quotes from the video
+            - Keep it under 180 words
+            - Use a friendly, professional tone
+
+        - role: user
+          content: |
+            Creator: ${ _.creator_name }
+            Channel: ${ _.channel_name }
+            Video Title: ${ _.video_title }
+            Video URL: ${ _.youtube_url }
+
+            Transcript excerpt (first 1500 chars):
+            ${ _.transcript_text[:1500] if _.transcript_text else 'No transcript available' }
+
+            Generate a personalized outreach email for this creator.
+
+            Context about us: We're a tech company that helps creators optimize their content strategy and grow their audience through data-driven insights.
+
+      # Extract email content from LLM response
+      - evaluate:
+          generated_email: ${ steps[-1].output.messages[-1].content if steps[-1].output else 'Email generation failed' }
+          email_subject: "Loved your video: ${ _.video_title[:50] }..."
+
+      # Send or save email based on configuration
+      - if: ${ _.send_emails }
+        then:
+          # Send the email
+          - tool: email_sender
+            arguments:
+              to: ${ _.email }
+              from: ${ _.email_address }
+              subject: ${ _.email_subject }
+              body: ${ _.generated_email }
+
+          # Update status to Sent
+          - tool: update_status
+            arguments:
+              range: D${ _.row_number }:E${ _.row_number }
+              values:
+                - ["Email Sent", "Email sent successfully"]
+        else:
+          # Just save as draft (update sheet with email content)
+          - tool: update_status
+            arguments:
+              range: D${ _.row_number }:F${ _.row_number }
+              values:
+                - ["Draft Ready", "${ _.email_subject }", "${ _.generated_email[:500] }"]
+
+      # Log completion for this row
+      - log: Processed row ${ _.row_number } for ${ _.creator_name } - Email ${ "Sent" if _.send_emails else "Draft saved" }
+
+# Step 6: Summary report
+- evaluate:
+    summary_report: |
+      === WORKFLOW SUMMARY ===
+      Total rows checked: ${ len(_.data_rows) }
+      Pending rows found: ${ len(_.pending_rows) }
+      Rows processed: ${ len(_.pending_rows) }
+      Emails: ${ "Sent" if _.send_emails else "Saved as drafts" }
+
+      Next steps:
+      ${ "- Check your sent folder for confirmation" if _.send_emails else "- Review drafts in column E-F of the sheet" }
+      - Monitor responses and engagement
+      - Update sheet with response tracking
+
+# Step 7: Return summary
+- return:
+    total_rows_checked: ${ len(_.data_rows) }
+    pending_rows_found: ${ len(_.pending_rows) }
+    rows_processed: ${ len(_.pending_rows) }
+    email_mode: ${ "sent" if _.send_emails else "drafts" }
+    status: Workflow completed successfully
+    report: ${ _.summary_report }

@@ -1,0 +1,18 @@
+name: Test No Input
+description: Test without any input
+
+tools:
+  - name: test_github
+    type: api_call
+    description: Test GitHub API
+    api_call:
+      method: GET
+      url: "https://api.github.com/users/github"
+
+main:
+  # Step 1: Make API call
+  - tool: test_github
+
+  # Step 2: Return result
+  - return:
+      result: "${ steps[1] }"

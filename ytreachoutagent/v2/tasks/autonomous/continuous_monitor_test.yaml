@@ -1,0 +1,31 @@
+name: Test Monitor
+description: Test task without http_request tool
+
+input_schema:
+  type: object
+  properties:
+    spreadsheet_id:
+      type: string
+    google_auth_token:
+      type: string
+    apify_token:
+      type: string
+  required:
+    - spreadsheet_id
+
+tools: []
+
+main:
+  # Step 1: Simple log
+  - log: "Starting monitor test"
+
+  # Step 2: Evaluate some data
+  - evaluate:
+      spreadsheet_id: ${ steps[0].input.spreadsheet_id }
+      message: "Processing spreadsheet"
+
+  # Step 3: Return result
+  - return:
+      success: "true"
+      spreadsheet_id: ${ _.spreadsheet_id }
+      message: ${ _.message }
